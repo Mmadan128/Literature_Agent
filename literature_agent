@@ -1,0 +1,71 @@
+# literature_agent_app.py
+import os
+import streamlit as st
+from dotenv import load_dotenv
+from clarifai.client.model import Model
+from clarifai.client.input import Inputs
+from langchain.document_loaders import TextLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from clarifai.client.model import Model
+
+# Load environment variables
+load_dotenv()
+if "HOME" not in os.environ:
+    os.environ["HOME"] = os.environ.get("USERPROFILE", os.environ.get("HOMEPATH", ""))
+
+CLARIFAI_PAT = os.getenv("CLARIFAI_PAT")
+EMBED_MODEL_URL = "https://clarifai.com/clarifai/main/models/BAAI-bge-base-en-v15"
+GEN_MODEL_URL = "https://clarifai.com/gcp/generate/models/gemini-2_0-flash"
+
+@st.cache_data(show_spinner=False)
+def load_and_chunk_book(file_path: str):
+    loader = TextLoader(file_path)
+    docs = loader.load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    return splitter.split_documents(docs)
+
+def embed_chunks(chunks):
+    embedder = Model(url=EMBED_MODEL_URL, pat=CLARIFAI_PAT)
+    contents = [chunk.page_content for chunk in chunks]
+    embeddings = [embedder.predict_by_bytes(c.encode(), input_type="text") for c in contents]
+    return list(zip(contents, embeddings))
+
+def get_top_chunks(query, embedded_chunks, top_k=3):
+    model = Model(url=EMBED_MODEL_URL, pat=CLARIFAI_PAT)
+    query_embed = model.predict_by_bytes(query.encode(), input_type="text")["outputs"][0]["data"]["embeddings"]["vector"]
+    
+    # naive cosine sim with list comprehension
+    from sklearn.metrics.pairwise import cosine_similarity
+    sims = [(text, cosine_similarity([query_embed], [e["outputs"][0]["data"]["embeddings"]["vector"]])[0][0])
+            for text, e in embedded_chunks]
+    sims.sort(key=lambda x: x[1], reverse=True)
+    return [t[0] for t in sims[:top_k]]
+
+def generate_response(context, question):
+    model = Model(url=GEN_MODEL_URL, pat=CLARIFAI_PAT)
+    full_prompt = f"Context:\n{context}\n\nQuestion: {question}\nAnswer:"
+    response = model.predict_by_bytes(full_prompt.encode(), input_type="text")
+    return response["outputs"][0]["data"]["text"]["raw"]
+
+# Streamlit UI
+st.title("📚 Literature Agent")
+
+uploaded_file = st.file_uploader("Upload a book (.txt file)", type=["txt"])
+if uploaded_file is not None:
+    with open("uploaded_book.txt", "wb") as f:
+        f.write(uploaded_file.read())
+
+    st.success("Book uploaded. Loading and processing...")
+    chunks = load_and_chunk_book("uploaded_book.txt")
+    embedded = embed_chunks(chunks)
+    st.success("Embedding completed. You can now ask questions.")
+
+    query = st.text_input("Ask a question about the book")
+    if query and st.button("Ask"):
+        relevant_chunks = get_top_chunks(query, embedded)
+        combined_context = "\n\n".join(relevant_chunks)
+        answer = generate_response(combined_context, query)
+        st.markdown("### 📖 Answer:")
+        st.write(answer)
+else:
+    st.info("Please upload a `.txt` file to begin.")
